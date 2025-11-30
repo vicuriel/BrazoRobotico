@@ -1,177 +1,177 @@
-import RPi.GPIO as GPIO
-import time
-import math
+/* PID de posición 0..360° para MD13S + 5840WG-555PM-EN (encoder 11 PPR)
+   Versión: ajuste de llegada precisa con compensación de fricción
+   Serial 115200: 0..360 | z | s | ?
+*/
 
-# ===== Configuración de Pines =====
-PIN_DIR = 17    # Dirección (ejemplo de pin GPIO)
-PIN_PWM = 18    # PWM (ejemplo de pin GPIO)
-PIN_ENC_A = 23  # A del encoder (ejemplo de pin GPIO)
-PIN_ENC_B = 24  # B del encoder (ejemplo de pin GPIO)
+const int PIN_DIR   = 8;
+const int PIN_PWM   = 9;
+const int PIN_ENC_A = 2;   // INT0
+const int PIN_ENC_B = 3;   // INT1
 
-# ===== Mecánico / Encoder =====
-PPR_MOTOR = 11.0
-GEAR_RATIO = 110.0
-CPR = PPR_MOTOR * GEAR_RATIO * 4.0
+// ===== Mecánico / Encoder =====
+const float PPR_MOTOR = 11.0f;
+// Si comprobaste otra relación, cámbiala aquí:
+const float GEAR_RATIO = 100.0f;
+const float CPR = PPR_MOTOR * GEAR_RATIO * 4.0f;
 
-SIGN_DIR = -1
+const int SIGN_DIR = -1;
 
-# ===== PID =====
-Kp = 1.35
-Ki = 0.80
-Kd = 0.22
-Ts = 0.01
-integ = 0.0
-INTEG_LIM = 150.0
+// ===== PID (AJUSTADOS) =====
+float Kp = 1.35f;    // ★ CHANGED (antes 1.0) más “firme” sin pasarse
+float Ki = 0.80f;    // ★ CHANGED (antes 0.5) quita error residual
+float Kd = 0.22f;    // ★ CHANGED (antes 0.15) freno suave
 
-DEADZONE_DEG = 0.8
-PWM_MAX = 140
-PWM_MIN = 45
+float Ts = 0.01f;    // 10 ms
+float integ = 0.0f;
+const float INTEG_LIM = 150.0f;  // ★ CHANGED (antes 120) más margen
 
-PWM_STATIC = 18
-BOOST_OFF_DEG = 12.0
+// ===== Límites / zona muerta =====
+const float DEADZONE_DEG = 0.8f;  // ★ CHANGED (antes 1.2) mayor precisión final
+const int   PWM_MAX = 140;        // ★ CHANGED (antes 120) un poco más de “pulmón”
+const int   PWM_MIN = 45;         // ★ CHANGED (antes 35) vence fricción
 
-# Filtros
-pwmFiltered = 0.0
-ALPHA_PWM = 0.25
-wFilt = 0.0
-ALPHA_D = 0.25
+// ===== Compensación de fricción (NUEVO) =====
+// Cuando hay error, añadimos un “offset” que se va apagando cerca del objetivo
+const int   PWM_STATIC = 18;      // ★ NEW empujón fijo para arrancar
+const float BOOST_OFF_DEG = 12.0; // ★ NEW por encima de este error aplica todo el boost
 
-encCount = 0
-encPrev = 0
-targetDeg = 0.0
-tPrev = 0
+// Filtros
+float pwmFiltered = 0.0f;
+const float ALPHA_PWM = 0.25f;
 
-# ===== Funciones Utilitarias =====
-def wrap360(a):
-    while a >= 360:
-        a -= 360
-    while a < 0:
-        a += 360
-    return a
+float wFilt = 0.0f;
+const float ALPHA_D = 0.25f;
 
-def cnt2deg(c):
-    return wrap360((float(c) * 360.0) / CPR)
+volatile long encCount = 0;
+long   encPrev = 0;
+float  targetDeg = 0.0f;
+unsigned long tPrev = 0;
 
-def angErr(tgt, act):
-    e = tgt - act
-    while e > 180:
-        e -= 360
-    while e < -180:
-        e += 360
-    return e
+// ===== Utilidades =====
+inline float wrap360(float a){ while(a>=360)a-=360; while(a<0)a+=360; return a; }
+inline float cnt2deg(long c){ return wrap360((float)c * 360.0f / CPR); }
+inline float angErr(float tgt,float act){
+  float e=tgt-act; while(e>180)e-=360; while(e<-180)e+=360; return e;
+}
 
-# ===== Interrupciones del Encoder =====
-def isrA(channel):
-    global encCount
-    a = GPIO.input(PIN_ENC_A)
-    b = GPIO.input(PIN_ENC_B)
-    encCount += SIGN_DIR if a == b else -SIGN_DIR
+// ===== ISRs =====
+void isrA(){ bool a=digitalRead(PIN_ENC_A),b=digitalRead(PIN_ENC_B); encCount += (a==b)? SIGN_DIR : -SIGN_DIR; }
+void isrB(){ bool a=digitalRead(PIN_ENC_A),b=digitalRead(PIN_ENC_B); encCount += (a!=b)? SIGN_DIR : -SIGN_DIR; }
 
-def isrB(channel):
-    global encCount
-    a = GPIO.input(PIN_ENC_A)
-    b = GPIO.input(PIN_ENC_B)
-    encCount += SIGN_DIR if a != b else -SIGN_DIR
+void setup(){
+  Serial.begin(115200);
+  pinMode(PIN_DIR,OUTPUT); pinMode(PIN_PWM,OUTPUT);
+  pinMode(PIN_ENC_A,INPUT); pinMode(PIN_ENC_B,INPUT);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_A),isrA,CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_B),isrB,CHANGE);
 
-# ===== Configuración del GPIO =====
-GPIO.setmode(GPIO.BCM)  # Usamos numeración BCM de pines
-GPIO.setup(PIN_DIR, GPIO.OUT)
-GPIO.setup(PIN_PWM, GPIO.OUT)
-GPIO.setup(PIN_ENC_A, GPIO.IN)
-GPIO.setup(PIN_ENC_B, GPIO.IN)
+  analogWrite(PIN_PWM,0); digitalWrite(PIN_DIR,LOW);
+  noInterrupts(); encCount=0; interrupts();
+  targetDeg=0; integ=0; pwmFiltered=0; wFilt=0; encPrev=encCount; tPrev=millis();
 
-# Configuración de interrupciones para el encoder
-GPIO.add_event_detect(PIN_ENC_A, GPIO.BOTH, callback=isrA)
-GPIO.add_event_detect(PIN_ENC_B, GPIO.BOTH, callback=isrB)
+  Serial.println(F("PID ajustado listo ✅ 0..360 | z | s | ?"));
+}
 
-# Función para controlar el motor
-def control_motor():
-    global encPrev, targetDeg, integ, pwmFiltered, wFilt
+void loop(){
+  leerComandos();
 
-    t = time.time()
-    if t - tPrev >= Ts:
-        tPrev = t
-        encNow = encCount
-        ang = cnt2deg(encNow)
-        e = angErr(targetDeg, ang)
+  unsigned long t=millis();
+  if(t - tPrev >= (unsigned long)(Ts*1000)){
+    tPrev=t;
 
-        # Velocidad angular (deg/s) + filtro
-        dCounts = encNow - encPrev
-        w = ((float(dCounts) * 360.0) / CPR) / Ts
-        wFilt = ALPHA_D * w + (1.0 - ALPHA_D) * wFilt
+    long  encNow = encCount;
+    float ang    = cnt2deg(encNow);
+    float e      = angErr(targetDeg, ang);
 
-        if abs(e) < DEADZONE_DEG:
-            integ = 0.0
-            pwmFiltered = 0.0
-            GPIO.output(PIN_DIR, GPIO.LOW)
-            GPIO.output(PIN_PWM, 0)
-        else:
-            # PI con anti-windup (clamping)
-            integ += Ki * Ts * e
-            if integ > INTEG_LIM:
-                integ = INTEG_LIM
-            if integ < -INTEG_LIM:
-                integ = -INTEG_LIM
+    // Velocidad angular (deg/s) + filtro
+    long dCounts = encNow - encPrev;
+    float w = ( (float)dCounts * 360.0f / CPR ) / Ts;
+    wFilt = ALPHA_D*w + (1.0f-ALPHA_D)*wFilt;
 
-            # PID (derivada sobre la medida)
-            u = Kp * e + integ - Kd * wFilt
+    if (fabs(e) < DEADZONE_DEG){
+      // Dentro de la ventana de precisión: paro y limpio integral
+      integ = 0.0f;
+      pwmFiltered = 0.0f;
+      analogWrite(PIN_PWM, 0);
+    } else {
+      // PI con anti-windup (clamping)
+      integ += Ki*Ts*e;
+      if (integ >  INTEG_LIM) integ =  INTEG_LIM;
+      if (integ < -INTEG_LIM) integ = -INTEG_LIM;
 
-            # Compensación de fricción/estática
-            boost = 0.0
-            ae = abs(e)
-            if ae > DEADZONE_DEG:
-                k = 1.0 if ae >= BOOST_OFF_DEG else (ae - DEADZONE_DEG) / (BOOST_OFF_DEG - DEADZONE_DEG)
-                if k < 0:
-                    k = 0
-                boost = PWM_STATIC * k
+      // PID (derivada sobre la medida)
+      float u = Kp*e + integ - Kd*wFilt;
 
-            pwm = int(abs(u) + boost)
-            if pwm > PWM_MAX:
-                pwm = PWM_MAX
-            if pwm < PWM_MIN:
-                pwm = PWM_MIN
+      // ===== Compensación de fricción/estática (★ NEW) =====
+      // Aplicamos un offset que disminuye linealmente a medida que |e| -> 0
+      float boost = 0.0f;
+      float ae = fabs(e);
+      if (ae > DEADZONE_DEG){
+        float k = ae >= BOOST_OFF_DEG ? 1.0f : (ae - DEADZONE_DEG) / (BOOST_OFF_DEG - DEADZONE_DEG);
+        if (k < 0) k = 0;
+        boost = PWM_STATIC * k;
+      }
 
-            # Suavizado
-            pwmFiltered = ALPHA_PWM * pwm + (1.0 - ALPHA_PWM) * pwmFiltered
+      // PWM y dirección
+      int pwm = (int)(fabs(u) + boost);
+      if (pwm > PWM_MAX) pwm = PWM_MAX;
+      if (pwm < PWM_MIN) pwm = PWM_MIN;
 
-            GPIO.output(PIN_DIR, GPIO.HIGH if u >= 0 else GPIO.LOW)
-            GPIO.output(PIN_PWM, pwmFiltered)
+      // Suavizado
+      pwmFiltered = ALPHA_PWM*pwm + (1.0f-ALPHA_PWM)*pwmFiltered;
 
-        encPrev = encNow
+      digitalWrite(PIN_DIR, (u>=0)?HIGH:LOW);
+      analogWrite(PIN_PWM, (int)pwmFiltered);
+    }
 
-# Función para leer comandos desde la consola (serial)
-def leer_comandos():
-    global targetDeg
-    while True:
-        comando = input()
-        if comando == 'z' or comando == 'Z':
-            encCount = 0
-            targetDeg = 0
-            integ = 0
-            pwmFiltered = 0
-            wFilt = 0
-            print(">> Cero puesto (0°)")
-        elif comando == 's' or comando == 'S':
-            targetDeg = cnt2deg(encCount)
-            integ = 0
-            pwmFiltered = 0
-            print(">> Parado en angulo actual")
-        elif comando == '?':
-            print(f"ang={cnt2deg(encCount)}  tgt={targetDeg}")
-        else:
-            try:
-                v = float(comando)
-                if 0.0 <= v <= 360.0:
-                    targetDeg = wrap360(v)
-                    print(f">> Nuevo setpoint: {targetDeg}°")
-                else:
-                    print("Comando invalido. Usa 0..360, o z / s / ?")
-            except ValueError:
-                print("Comando invalido. Usa 0..360, o z / s / ?")
+    encPrev = encNow;
+  }
 
-# ===== Main Loop =====
-if _name_ == "_main_":
-    print("PID ajustado listo ✅ 0..360 | z | s | ?")
-    while True:
-        control_motor()
-        leer_comandos()
+  // Telemetría
+  static unsigned long tlog=0;
+  if(millis()-tlog >= 300){
+    tlog=millis();
+    Serial.print(F("ang=")); Serial.print(cnt2deg(encCount),1);
+    Serial.print(F("  tgt=")); Serial.print(targetDeg,1);
+    Serial.print(F("  pwmF=")); Serial.print(pwmFiltered,0);
+    Serial.println();
+  }
+}
+
+void leerComandos(){
+  static String buf;
+  while(Serial.available()){
+    char c=Serial.read();
+    if(c=='\r') continue;
+    if(c=='\n'){ buf.trim(); if(buf.length()) procesarLinea(buf); buf=""; }
+    else buf+=c;
+  }
+}
+
+void procesarLinea(const String& s){
+  if(s=="z"||s=="Z"){
+    noInterrupts(); encCount=0; interrupts();
+    targetDeg=0; integ=0; pwmFiltered=0; wFilt=0;
+    Serial.println(F(">> Cero puesto (0°)"));
+    return;
+  }
+  if(s=="s"||s=="S"){
+    targetDeg=cnt2deg(encCount);
+    integ=0; pwmFiltered=0; analogWrite(PIN_PWM,0);
+    Serial.println(F(">> Parado en angulo actual"));
+    return;
+  }
+  if(s=="?"){
+    Serial.print(F("ang=")); Serial.print(cnt2deg(encCount),2);
+    Serial.print(F(" tgt=")); Serial.print(targetDeg,2);
+    Serial.print(F(" CPR=")); Serial.println(CPR,0);
+    return;
+  }
+  float v=s.toFloat();
+  if(v>=0.0f && v<=360.0f){
+    targetDeg=wrap360(v);
+    Serial.print(F(">> Nuevo setpoint: ")); Serial.print(targetDeg,1); Serial.println(F("°"));
+  } else {
+    Serial.println(F("Comando invalido. Usa 0..360, o z / s / ?"));
+  }
+}
