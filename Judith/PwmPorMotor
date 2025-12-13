@@ -1,0 +1,753 @@
+/* SCARA: 2 motores DC con PID + 2 servos controlados por Serial - ESP32
+
+   M1 (q1): DC con encoder
+     DIR   = 25
+     PWM   = 26  (LEDC canal 0)
+     ENC A = 34
+     ENC B = 35
+
+   M2 (q2): DC con encoder
+     DIR   = 18
+     PWM   = 19  (LEDC canal 1)
+     ENC A = 32
+     ENC B = 33
+
+   q3: Servo SG90    -> pin 14
+   q4: Servo HK15138 -> pin 27
+
+   Serial 115200:
+     ?                  -> estado
+     z / z1 / z2        -> cero encoders
+     s / s1 / s2        -> stop
+     m1 <deg>, m2 <deg>, m <d1> <d2>
+     q3 <deg>, q4 <deg>
+*/
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <ESP32Servo.h>
+
+// ---------------- WIFI -----------------
+//const char* ssid = "Flia Jacquet";
+//const char* password = "nicolealeli";
+
+const char* ssid = "LAB_JBNACIMIENTO";
+const char* password = "L@bJBN#2024";
+
+WiFiServer tcpServer(5000);   // PUERTO TCP REAL
+WiFiClient tcpClient;
+String tcpBuf = "";
+
+// ===== RELE =====
+const int relePin = 22;   // Cambia si necesitás otro pin
+
+// --------- Pines M1 (ESP32) ----------
+const int M1_DIR   = 25;
+const int M1_PWM   = 26;
+const int M1_ENC_A = 34;
+const int M1_ENC_B = 35;
+
+// --------- Pines M2 (ESP32) ----------
+const int M2_DIR   = 18;
+const int M2_PWM   = 19;
+const int M2_ENC_A = 32;
+const int M2_ENC_B = 33;
+
+// --------- Servos (q3, q4) ----------
+const int SERVO_Q3_PIN = 14;
+const int SERVO_Q4_PIN = 27;
+
+Servo servoQ3;
+Servo servoQ4;
+int q3Pos = 180;
+int q4Pos = 0;
+
+// ===== PWM (LEDC) =====
+const int CH_M1_PWM   = 8;
+const int CH_M2_PWM   = 9;
+const int PWM_FREQ    = 20000; // 20 kHz
+const int PWM_RES_BIT = 8;     // 0..255
+
+// ===== Mecánico / Encoder =====
+const float PPR_MOTOR = 11.0f;
+const float GEAR_RATIO = 110.0f;
+const float CPR = PPR_MOTOR * GEAR_RATIO * 4.0f;
+
+const int SIGN_DIR_M1 = 1;
+const int SIGN_DIR_M2 = 1;
+
+// ===== PID =====
+float Kp = 0.088f, Ki = 0.156f, Kd = 0.0f;
+float Ts = 0.01f;         // 10 ms
+float INTEG_LIM = 60.0f;
+
+const float DEADZONE_DEG = 0.5f;
+
+// ===== Limites PWM por motor (FIJOS) =====
+int PWM1_MAX = 100;   // q1 / M1
+int PWM1_MIN = 40;
+
+int PWM2_MAX = 90;   //q2//M2
+int PWM2_MIN = 40;
+
+const int   PWM_STATIC = 18;
+const float BOOST_OFF_DEG = 12.0f;
+
+const float ALPHA_PWM = 0.25f;
+const float ALPHA_D   = 0.25f;
+
+// ===== Estado M1 =====
+volatile long enc1Count = 0;
+long   enc1Prev = 0;
+float  integ1 = 0.0f;
+float  pwmF1 = 0.0f;
+float  wFilt1 = 0.0f;
+
+// ===== Estado M2 =====
+volatile long enc2Count = 0;
+long   enc2Prev = 0;
+float  integ2 = 0.0f;
+float  pwmF2 = 0.0f;
+float  wFilt2 = 0.0f;
+
+// Setpoints
+float target1Deg = 0.0f;
+float target2Deg = 0.0f;
+
+// ===== Estado Pick & Place =====
+bool pnp_active = false;          // indica si hay un pickandplace en progreso
+int  pnp_state = 0;               // 0: idle, 1: esperando PUMP 1 tras pick, 2: esperando PUMP 0 tras place
+// Parámetros guardados para continuar
+float pnp_q1_place, pnp_q2_place;
+int pnp_q3_place, pnp_q4_place;
+unsigned long pnp_delay_ms;
+unsigned long tPrev = 0;
+
+// ===== Utils =====
+inline float wrap360(float a){
+  while(a >= 360) a -= 360;
+  while(a < 0)    a += 360;
+  return a;
+}
+
+inline float cnt2deg(long c){
+  // Ángulo absoluto en grados, puede ser negativo o mayor a 360
+  return (float)c * 360.0f / CPR;
+}
+
+inline float angErr(float tgt,float act){
+  // Error lineal: target - actual (permite -∞..+∞)
+  return tgt - act;
+}
+
+// ===== ISRs M1 (ENC A/B) =====
+void IRAM_ATTR isr1A(){
+  bool a = digitalRead(M1_ENC_A);
+  bool b = digitalRead(M1_ENC_B);
+  enc1Count += (a == b) ? SIGN_DIR_M1 : -SIGN_DIR_M1;
+}
+
+void IRAM_ATTR isr1B(){
+  bool a = digitalRead(M1_ENC_A);
+  bool b = digitalRead(M1_ENC_B);
+  enc1Count += (a != b) ? SIGN_DIR_M1 : -SIGN_DIR_M1;
+}
+
+// ===== ISRs M2 (ENC A/B) =====
+void IRAM_ATTR isr2A(){
+  bool a = digitalRead(M2_ENC_A);
+  bool b = digitalRead(M2_ENC_B);
+  enc2Count += (a == b) ? SIGN_DIR_M2 : -SIGN_DIR_M2;
+}
+
+void IRAM_ATTR isr2B(){
+  bool a = digitalRead(M2_ENC_A);
+  bool b = digitalRead(M2_ENC_B);
+  enc2Count += (a != b) ? SIGN_DIR_M2 : -SIGN_DIR_M2;
+}
+
+// ===== Función Pick & Place =====
+void pickandplace(float q1_pick, float q1_place, float q2_pick, float q2_place,
+                  int q3_pick, int q3_place, int q4_pick, int q4_place,
+                  unsigned long delay_ms){
+  if (q3_pick < 0 || q3_pick > 180 || q3_place < 0 || q3_place > 180 ||
+      q4_pick < 0 || q4_pick > 180 || q4_place < 0 || q4_place > 180){
+    Serial.println(">> ERROR pickandplace: q3/q4 deben estar en [0..180]");
+    return;
+  }
+
+  pnp_q1_place = q1_place;
+  pnp_q2_place = q2_place;
+  pnp_q3_place = q3_place;
+  pnp_q4_place = q4_place;
+  pnp_delay_ms = delay_ms;
+
+  Serial.print(">> PICK: moviendo a q1="); Serial.print(q1_pick);
+  Serial.print(" q2="); Serial.print(q2_pick);
+  Serial.print(" q3="); Serial.print(q3_pick);
+  Serial.print(" q4="); Serial.println(q4_pick);
+
+  target1Deg = q1_pick;
+  target2Deg = q2_pick;
+  q3Pos = q3_pick;
+  q4Pos = q4_pick;
+  servoQ3.write(q3_pick);
+  servoQ4.write(q4_pick);
+
+  pnp_active = true;
+  pnp_state = 1;
+  Serial.println(">> Esperando PUMP 1 para continuar...");
+}
+
+void pnp_continue_after_pump(){
+  if (pnp_state == 1){
+    delay(pnp_delay_ms);
+
+    Serial.print(">> PLACE: moviendo a q1="); Serial.print(pnp_q1_place);
+    Serial.print(" q2="); Serial.print(pnp_q2_place);
+    Serial.print(" q3="); Serial.print(pnp_q3_place);
+    Serial.print(" q4="); Serial.println(pnp_q4_place);
+
+    target1Deg = pnp_q1_place;
+    target2Deg = pnp_q2_place;
+    q3Pos = pnp_q3_place;
+    q4Pos = pnp_q4_place;
+    servoQ3.write(pnp_q3_place);
+    servoQ4.write(pnp_q4_place);
+
+    pnp_state = 2;
+    Serial.println(">> Esperando PUMP 0 para finalizar...");
+  }
+}
+
+void pnp_finish(){
+  if (pnp_state == 2){
+    pnp_active = false;
+    pnp_state = 0;
+    Serial.println(">> pickandplace completado");
+  }
+}
+
+// ===== Control DC (adaptado a LEDC) =====
+void controlUno(long encNow, long &encPrev, float &integ, float &wFilt, float &pwmFiltered,
+                int pinDir, int pwmChannel, float targetDeg,
+                int pwmMin, int pwmMax)
+{
+  float ang = cnt2deg(encNow);
+  float e = angErr(targetDeg, ang);
+
+  long dCounts = encNow - encPrev;
+  float w = ((float)dCounts * 360.0f / CPR) / Ts;
+  wFilt = ALPHA_D*w + (1.0f-ALPHA_D)*wFilt;
+
+  if (fabs(e) < DEADZONE_DEG){
+    integ = 0.0f;
+    pwmFiltered = 0.0f;
+    ledcWrite(pwmChannel, 0);
+  } else {
+    integ += Ki*Ts*e;
+    if(integ > INTEG_LIM) integ = INTEG_LIM;
+    if(integ < -INTEG_LIM) integ = -INTEG_LIM;
+
+    float u = Kp*e + integ - Kd*wFilt;
+
+    float boost = 0.0f;
+    float ae = fabs(e);
+    if(ae > DEADZONE_DEG){
+      float k = ae>=BOOST_OFF_DEG?1.0f:(ae-DEADZONE_DEG)/(BOOST_OFF_DEG-DEADZONE_DEG);
+      if(k<0) k=0;
+      boost = PWM_STATIC*k;
+    }
+
+    int pwm = (int)(fabs(u)+boost);
+    if(pwm > pwmMax) pwm = pwmMax;
+    if(pwm < pwmMin) pwm = pwmMin;
+
+    pwmFiltered = ALPHA_PWM*pwm + (1.0f-ALPHA_PWM)*pwmFiltered;
+
+    if (u >= 0) digitalWrite(pinDir, HIGH);
+    else        digitalWrite(pinDir, LOW);
+
+    ledcWrite(pwmChannel, (int)pwmFiltered);
+  }
+
+  encPrev = encNow;
+}
+
+// ===== Serial =====
+void procesarLinea(const String &s);   // forward
+
+void leerComandos(){
+  static String buf="";
+  while(Serial.available()){
+    char c = Serial.read();
+    Serial.print(c);
+    if(c=='\r') continue;
+    if(c=='\n'){
+      buf.trim();
+      if(buf.length()) procesarLinea(buf);
+      buf="";
+    } else buf += c;
+  }
+}
+
+bool parse2floats(const String &s, float &a, float &b) {
+  int start = s.indexOf(' ');
+  if (start < 0) return false;
+
+  String rest = s.substring(start + 1);
+  rest.trim();
+
+  int sep = rest.indexOf(' ');
+  if (sep < 0) return false;
+
+  a = rest.substring(0, sep).toFloat();
+  b = rest.substring(sep + 1).toFloat();
+  return true;
+}
+
+bool parse4floatsQ(const String &s, float &q1, float &q2, float &q3, float &q4) {
+  int firstSpace = s.indexOf(' ');
+  if (firstSpace < 0) return false;
+
+  String rest = s.substring(firstSpace + 1);
+  rest.trim();
+
+  int p1 = rest.indexOf(' ');
+  if (p1 < 0) return false;
+
+  int p2 = rest.indexOf(' ', p1 + 1);
+  if (p2 < 0) return false;
+
+  int p3 = rest.indexOf(' ', p2 + 1);
+  if (p3 < 0) return false;
+
+  q1 = rest.substring(0, p1).toFloat();
+  q2 = rest.substring(p1 + 1, p2).toFloat();
+  q3 = rest.substring(p2 + 1, p3).toFloat();
+  q4 = rest.substring(p3 + 1).toFloat();
+
+  return true;
+}
+
+void procesarLinea(const String &s){
+
+  if (s.startsWith("Q ")) {
+    float q1, q2, q3, q4;
+    if (!parse4floatsQ(s, q1, q2, q3, q4)) {
+      Serial.println("Formato invalido para Q. Uso: Q q1 q2 q3 q4");
+      return;
+    }
+
+    if (q1 < -90.0f) q1 = -90.0f;
+    if (q1 >  90.0f) q1 =  90.0f;
+
+    if (q2 < -90.0f) q2 = -90.0f;
+    if (q2 >  90.0f) q2 =  90.0f;
+
+    if (q3 < 0.0f)   q3 = 0.0f;
+    if (q3 > 180.0f) q3 = 180.0f;
+
+    if (q4 < 0.0f)   q4 = 0.0f;
+    if (q4 > 180.0f) q4 = 180.0f;
+
+    target1Deg = q1;
+    target2Deg = q2;
+
+    q3Pos = (int)q3;
+    q4Pos = (int)q4;
+    servoQ3.write(q3Pos);
+    servoQ4.write(q4Pos);
+
+    Serial.print(">> Q: tgt1="); Serial.print(target1Deg);
+    Serial.print(" tgt2=");      Serial.print(target2Deg);
+    Serial.print(" q3=");        Serial.print(q3Pos);
+    Serial.print(" q4=");        Serial.println(q4Pos);
+
+    return;
+  }
+
+  if(s=="?"){
+    Serial.print("M1 ang="); Serial.print(cnt2deg(enc1Count));
+    Serial.print(" tgt1="); Serial.print(target1Deg);
+
+    Serial.print(" | M2 ang="); Serial.print(cnt2deg(enc2Count));
+    Serial.print(" tgt2="); Serial.print(target2Deg);
+
+    Serial.print(" | q3="); Serial.print(q3Pos);
+    Serial.print(" q4="); Serial.println(q4Pos);
+    return;
+  }
+
+  if(s=="ZERO"){
+    noInterrupts(); enc1Count=0; enc2Count=0; interrupts();
+    target1Deg=target2Deg=0;
+    integ1=integ2=0;
+    pwmF1=pwmF2=0;
+    Serial.println(">> Cero ambos");
+    return;
+  }
+
+  if(s=="ZERO1"){
+    noInterrupts(); enc1Count=0; interrupts();
+    target1Deg=0;
+    integ1=pwmF1=0;
+    Serial.println(">> Cero M1");
+    return;
+  }
+
+  if(s=="ZERO2"){
+    noInterrupts(); enc2Count=0; interrupts();
+    target2Deg=0;
+    integ2=pwmF2=0;
+    Serial.println(">> Cero M2");
+    return;
+  }
+
+  if(s=="STOP"){
+    target1Deg = cnt2deg(enc1Count);
+    target2Deg = cnt2deg(enc2Count);
+    integ1=integ2=0;
+    pwmF1=pwmF2=0;
+    Serial.println(">> Stop ambos");
+    return;
+  }
+
+  if(s=="STOP1"){
+    target1Deg=cnt2deg(enc1Count);
+    integ1=pwmF1=0;
+    Serial.println(">> Stop M1");
+    return;
+  }
+
+  if(s=="STOP2"){
+    target2Deg=cnt2deg(enc2Count);
+    integ2=pwmF2=0;
+    Serial.println(">> Stop M2");
+    return;
+  }
+
+  if(s.startsWith("q1 ")){
+    const char* p = s.c_str() + 3;
+    while(*p==' ') p++;
+    float v = atof(p);
+    if(v < -360.0f || v > 360.0f){
+      Serial.println("Valor fuera de rango (-360-360)");
+      return;
+    } else {
+      target1Deg = v;
+      Serial.print(">> tgt1="); Serial.println(target1Deg);
+    }
+    return;
+  }
+
+  if(s.startsWith("q2 ")){
+    const char* p = s.c_str() + 3;
+    while(*p==' ') p++;
+    float v = atof(p);
+    if(v < -360.0f || v > 360.0f){
+      Serial.println("Valor fuera de rango (-360-360)");
+      return;
+    } else {
+      target2Deg = v;
+      Serial.print(">> tgt2="); Serial.println(target2Deg);
+    }
+    return;
+  }
+
+  if(s.startsWith("m ")){
+    float a,b;
+    if(parse2floats(s,a,b)){
+      if (a < -90.0f || a > 90.0f || b < -90.0f || b > 90.0f) {
+        Serial.println("Valor fuera de rango (-90 a 90)");
+        return;
+      }
+
+      target1Deg = a;
+      target2Deg = b;
+
+      Serial.print(">> tgt1="); Serial.print(target1Deg);
+      Serial.print(" tgt2=");   Serial.println(target2Deg);
+    }
+    return;
+  }
+
+  if(s.startsWith("q3 ")){
+    int v = atoi(s.c_str() + 3);
+    if(v>=0 && v<=180){
+      q3Pos=v;
+      servoQ3.write(v);
+      Serial.print(">> q3="); Serial.println(v);
+    } else {
+      Serial.println("Valor fuera de rango (0-180)");
+    }
+    return;
+  }
+
+  if(s.startsWith("q4 ")){
+    servoQ4.attach(SERVO_Q4_PIN);
+    int v = atoi(s.c_str() + 3);
+    if(v>=0 && v<=180){
+      q4Pos=v;
+      servoQ4.write(v);
+      Serial.print(">> q4="); Serial.println(v);
+    } else {
+      Serial.println("Valor fuera de rango (0-180)");
+    }
+    return;
+  }
+
+  if (s.startsWith("PUMP")) {
+    int v = atoi(s.c_str() + 4);
+    if (v == 1) {
+      digitalWrite(relePin, HIGH);
+      Serial.println(">> RELAY ON");
+      if (pnp_active && pnp_state == 1) pnp_continue_after_pump();
+    }
+    else if (v == 0) {
+      digitalWrite(relePin, LOW);
+      Serial.println(">> RELAY OFF");
+      if (pnp_active && pnp_state == 2) pnp_finish();
+    }
+    else {
+      Serial.println("Valor fuera de rango (0 ó 1)");
+    }
+    return;
+  }
+
+  if (s == "ENCODER") {
+    float q1_ang = cnt2deg(enc1Count);
+    float q2_ang = cnt2deg(enc2Count);
+    Serial.print(">> ENCODER: q1="); Serial.print(q1_ang, 3);
+    Serial.print("° q2="); Serial.print(q2_ang, 3); Serial.println("°");
+    return;
+  }
+
+  if (s == "STATE") {
+    float q1_now = cnt2deg(enc1Count);
+    float q2_now = cnt2deg(enc2Count);
+
+    String msg = "STATE ";
+    msg += String(q1_now, 2); msg += " ";
+    msg += String(q2_now, 2); msg += " ";
+    msg += String(q3Pos);     msg += " ";
+    msg += String(q4Pos);
+
+    Serial.println(msg);
+
+    if (tcpClient && tcpClient.connected()) {
+      tcpClient.println(msg);
+    }
+    return;
+  }
+
+  if (s == "STOP"){
+    target1Deg = cnt2deg(enc1Count);
+    target2Deg = cnt2deg(enc2Count);
+    integ1=integ2=0;
+    pwmF1=pwmF2=0;
+    Serial.println(">> STOP ambos");
+    return;
+  }
+
+  if (s == "HOME"){
+    target1Deg = 0.0f;
+    target2Deg = 0.0f;
+    integ1 = 0.0f;
+    integ2 = 0.0f;
+    Serial.println(">> HOME: moviendo q1/q2 a 0°");
+    return;
+  }
+
+  // KP / KI / PID -> ajustar ganancias por serial/TCP
+  {
+    String up = s;
+    up.toUpperCase();
+
+    if (up.startsWith("KP ")){
+      const char* p = s.c_str() + 3;
+      while(*p == ' ') p++;
+      float v = atof(p);
+      if (v >= 0.0f) {
+        Kp = v;
+        Serial.print(">> Kp="); Serial.println(Kp, 6);
+      } else {
+        Serial.println("Valor invalido para KP");
+      }
+      return;
+    }
+
+    if (up.startsWith("KI ")){
+      const char* p = s.c_str() + 3;
+      while(*p == ' ') p++;
+      float v = atof(p);
+      if (v >= 0.0f) {
+        Ki = v;
+        Serial.print(">> Ki="); Serial.println(Ki, 6);
+      } else {
+        Serial.println("Valor invalido para KI");
+      }
+      return;
+    }
+
+    if (up.startsWith("PID ")){
+      float a,b;
+      if (parse2floats(s, a, b)){
+        if (a >= 0.0f && b >= 0.0f){
+          Kp = a;
+          Ki = b;
+          Serial.print(">> PID aplicadas: Kp="); Serial.print(Kp, 6);
+          Serial.print(" Ki="); Serial.println(Ki, 6);
+        } else {
+          Serial.println("Valores invalidos para PID (deben ser >= 0)");
+        }
+      } else {
+        Serial.println("Uso: PID <Kp> <Ki>");
+      }
+      return;
+    }
+
+    if (up.startsWith("PICKANDPLACE ")){
+      String rest = s.substring(13);
+      rest.trim();
+
+      float vals[8];
+      unsigned long del = 0;
+
+      int parsed = sscanf(rest.c_str(), "%f %f %f %f %d %d %d %d %lu",
+                          &vals[0], &vals[1], &vals[2], &vals[3],
+                          (int*)&vals[4], (int*)&vals[5], (int*)&vals[6], (int*)&vals[7], &del);
+
+      if (parsed == 9){
+        Serial.println(">> Iniciando PICKANDPLACE...");
+        pickandplace(vals[0], vals[1], vals[2], vals[3],
+                     (int)vals[4], (int)vals[5], (int)vals[6], (int)vals[7], del);
+      } else {
+        Serial.println("Uso: PICKANDPLACE q1_pick q1_place q2_pick q2_place q3_pick q3_place q4_pick q4_place delay_ms");
+      }
+      return;
+    }
+  }
+
+  Serial.println("Comando invalido");
+  Serial.print(s);
+}
+
+// =======================================================
+// ===================== SETUP ===========================
+// =======================================================
+
+void setup(){
+  Serial.begin(115200);
+
+  // --- WIFI ---
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  Serial.print("Conectando a WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Conectado! IP: ");
+  Serial.println(WiFi.localIP());
+
+  // --- TCP SERVER ---
+  tcpServer.begin();
+  tcpServer.setNoDelay(true);
+  Serial.println("TCP server activo en puerto 5000");
+
+  // Servos
+  servoQ3.attach(SERVO_Q3_PIN);
+  delay(100);
+  servoQ3.write(180);
+  q3Pos = 180;
+  servoQ4.write(0);
+  delay(500);
+
+  // Motores
+  pinMode(M1_DIR,OUTPUT);
+  pinMode(M2_DIR,OUTPUT);
+
+  // PWM por LEDC
+  ledcSetup(CH_M1_PWM, PWM_FREQ, PWM_RES_BIT);
+  ledcAttachPin(M1_PWM, CH_M1_PWM);
+  ledcSetup(CH_M2_PWM, PWM_FREQ, PWM_RES_BIT);
+  ledcAttachPin(M2_PWM, CH_M2_PWM);
+
+  digitalWrite(M1_DIR,LOW); ledcWrite(CH_M1_PWM,0);
+  digitalWrite(M2_DIR,LOW); ledcWrite(CH_M2_PWM,0);
+
+  // Encoders
+  pinMode(M1_ENC_A,INPUT);
+  pinMode(M1_ENC_B,INPUT);
+  pinMode(M2_ENC_A,INPUT);
+  pinMode(M2_ENC_B,INPUT);
+
+  attachInterrupt(M1_ENC_A, isr1A, CHANGE);
+  attachInterrupt(M1_ENC_B, isr1B, CHANGE);
+  attachInterrupt(M2_ENC_A, isr2A, CHANGE);
+  attachInterrupt(M2_ENC_B, isr2B, CHANGE);
+
+  enc1Prev = enc1Count;
+  enc2Prev = enc2Count;
+
+  Serial.println("SCARA ESP32 listo.");
+
+  // Rele
+  pinMode(relePin, OUTPUT);
+  digitalWrite(relePin, LOW);
+}
+
+// =======================================================
+// ====================== LOOP ===========================
+// =======================================================
+
+void loop(){
+
+  // -------------------- USB SERIAL --------------------
+  leerComandos();
+
+  // --- Aceptar cliente TCP ---
+  if (!tcpClient.connected()) {
+    tcpClient.stop();
+    tcpClient = tcpServer.available();
+    tcpBuf = "";
+  }
+
+  // --- Leer comandos desde TCP ---
+  if (tcpClient && tcpClient.connected()) {
+    while (tcpClient.available()) {
+      char c = tcpClient.read();
+
+      if (c == '\n') {
+        tcpBuf.trim();
+        if (tcpBuf.length() > 0) procesarLinea(tcpBuf);
+        tcpBuf = "";
+      }
+      else if (c != '\r') {
+        tcpBuf += c;
+      }
+    }
+  }
+
+  // -------------------- CONTROL M1/M2 --------------------
+  unsigned long tNow = millis();
+  if (tNow - tPrev >= (unsigned long)(Ts*1000.0f)) {
+    tPrev = tNow;
+
+    // Control M1
+    long enc1Now = enc1Count;
+    controlUno(enc1Now, enc1Prev, integ1, wFilt1, pwmF1,
+               M1_DIR, CH_M1_PWM, target1Deg,
+               PWM1_MIN, PWM1_MAX);
+
+    // Control M2
+    long enc2Now = enc2Count;
+    controlUno(enc2Now, enc2Prev, integ2, wFilt2, pwmF2,
+               M2_DIR, CH_M2_PWM, target2Deg,
+               PWM2_MIN, PWM2_MAX);
+  }
+}
