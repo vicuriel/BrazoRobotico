@@ -1,6 +1,7 @@
 import socket
 
 CAM_IP = "192.168.135.64"   # IP de la PC con cámara
+#CAM_IP = "192.168.0.14"
 CAM_PORT = 6001             # Puerto del servidor de visión
 
 def get_object_localization():
@@ -37,8 +38,8 @@ def get_object_localization():
             print(f"Respuesta de cámara inválida: '{line}'")
             return None
 
-        x   = float(parts[1])
-        y   = float(parts[2])
+        x   = float(parts[1])/10
+        y   = float(parts[2])/10
         phi = float(parts[3])
         tipo = parts[4]
 

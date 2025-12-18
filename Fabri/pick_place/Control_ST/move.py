@@ -18,3 +18,5 @@ def move_to(x: float, y: float, z: float, phi: float, comm: RobotComm):
     comm.send_joint_command(q_target)
     time.sleep(2)
 
+if __name__ == "__main__":
+    move_to(18.6, 0.40999, 3.17, -90, RobotComm())

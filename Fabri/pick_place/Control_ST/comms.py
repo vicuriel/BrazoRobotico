@@ -1,8 +1,8 @@
 import socket
 import time
 
-ESP_IP = "192.168.0.16"           # IP del ESP32 Judith
-#ESP_IP = "192.168.135.63"           # IP del LAR
+#ESP_IP = "192.168.0.16"           # IP del ESP32 Judith
+ESP_IP = "192.168.135.63"           # IP del LAR
 ESP_PORT = 5000                     # Puerto TCP del ESP32
 Q3_SERVO_MAX = 4.4                  # Desplazamiento maximo q3 en cm
 

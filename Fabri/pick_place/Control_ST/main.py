@@ -1,21 +1,36 @@
+import matplotlib.pyplot as plt
+import numpy as np
+from kinematics import l1, l2
+from move import move_to
 from comms import RobotComm
 from kinematics import ik, fk
 from tasks import go_home, pick, place
 from vision_client import get_object_localization
 from config_limits import LIMITS
+from Simular import simular_pick_and_place
 
 comm: RobotComm | None = None
 
-def verificar_camara():
+def verificar_camara_y_simular():
     print("\n[Camara] Pidiendo detección...")
-    coord = get_object_localization()
-
+    try:
+        coord = get_object_localization()
+    except Exception as e:
+        print("No se pudo conectar con la cámara.")
+        return
     if coord is None:
         print("No se recibió nada válido de la cámara.")
         return
-    
     x, y, phi, tipo = coord
     print(f"Coordenadas recibidas: [{x:.2f}, {y:.2f}, {phi:.2f}] y tipo: {tipo}")
+    simular = input("¿Simular coordenadas? (s/n): ").strip().lower()
+    if simular == 's':
+        q_inicial = [18.6, 0.40999, 3.17, -90]
+        # Se asume z_pick = 3.1 (ajustable)
+        q_pick = [x, y, 3.1, phi]
+        q_place = [-5, -15, 2.0, 0.0]
+        q_home = [0.0, 0.0, 5.0, 0.0]
+        simular_pick_and_place(q_inicial, q_pick, q_place, q_home)
 
 def verificar_cinematica():
     print("------------------------------------")
@@ -70,9 +85,9 @@ def pick_and_place(comm: RobotComm):
       5) Vuelve a HOME
     """
     print("\n------ JF XV INICIADO ------")
-
-    #coord = get_object_localization()
-    coord = (10.0, 10.0, -90.0, "tipo1")  # Para pruebas sin cámara
+    
+    #coord = (10, -10, 0, 0)
+    coord = get_object_localization()
     if coord is not None:    
         x, y, phi, tipo = coord
 
@@ -83,22 +98,30 @@ def pick_and_place(comm: RobotComm):
 
         q_prev = comm.request_state()
         q_sol  = ik(x, y, 0.0, phi, q_prev=q_prev, limits=LIMITS, codo_estandar=None)
+
         print("-----------------------------------------------------------------")
         print(f"Solución IK para esa localizacion: {q_sol}")
         print("-----------------------------------------------------------------")
 
+        # Si la localización es inalcanzable, cancelar y volver a home
+        if q_sol is None:
+            print("Localización inalcanzable. Cancelando movimiento y volviendo a HOME.")
+            go_home(comm)
+            return
+
         pick(x, y, phi, comm)
 
         print("-> Realizando pick")
-        print("-----------------------------------------------------------------------------------")
         fk_vals = fk(*comm.request_state())
         fk_fmt = tuple(float(f"{float(val):.2f}") for val in fk_vals)
+        print("-----------------------------------------------------------------------------------")
         print(f"Solucion FK del efector con articulaciones actuales: {fk_fmt}")
         print("-----------------------------------------------------------------------------------")
 
-        place(10.0, -10.0, 0.0, comm)
         print("-> Realizando place")
+        place(-5, 15, 0.0, comm)
 
+        print("-> Volviendo a HOME")
         go_home(comm)
     else:   
         print("No se detectó ningún objeto válido")
@@ -107,7 +130,8 @@ def main():
     global comm
     comm = RobotComm()
     comm.connect()
-    comm.zero_all()
+    #comm.zero_all()
+    move_to(18.6, 0.40999, 3.17, -90, comm)
 
     print("-------------------------------------")
     print("-- Ctrl + C = parada de emergencia --")
@@ -117,22 +141,16 @@ def main():
         while True:
             print("\n--------------------------------")
             print("Seleccione una opción:")
-            print("1. Verificar la cámara")
+            print("1. Consultar espacio articular")
             print("2. Verificar cinemática")
-            print("3. Consultar espacio articular")
+            print("3. Verificar cámara y/o simular Pick & Place")
             print("4. Comenzar Pick & Place")
-            print("5. Zero de motores")
-            print("6. Ir a HOME")
-            print("7. Salir")
+            print("5. Salir")
             print("-------------------------------------")
 
             opcion = input("-> ").strip()
 
             if opcion == "1":
-                verificar_camara()
-            elif opcion == "2":
-                verificar_cinematica()
-            elif opcion == "3":
                 if comm is None:
                     print("Sin conexión al robot.")
                 else:
@@ -144,24 +162,16 @@ def main():
                         f"q3 = {q[2]:.2f} cm\n"
                         f"q4 = {q[3]:.2f}°"
                     )
+            elif opcion == "2":
+                verificar_cinematica()
+            elif opcion == "3":
+                verificar_camara_y_simular()
             elif opcion == "4":
                 if comm is None:
                     print("Sin conexión al robot.")
                 else:
                     pick_and_place(comm)
             elif opcion == "5":
-                if comm is None:
-                    print("Sin conexión al robot.")
-                else:
-                    comm.zero_all()
-                    print("Motores llevados a posición cero.")
-            elif opcion == "6":
-                if comm is None:
-                    print("Sin conexión al robot.")
-                else:
-                    go_home(comm)
-                    print("Robot llevado a posición HOME.")
-            elif opcion == "7":
                 print("Saliendo...")
                 break
             else:
@@ -180,6 +190,7 @@ if __name__ == "__main__":
         try:
             if comm is not None:
                 comm.stop()
+                comm.pump(False)
                 comm.close()
         except Exception:
             pass
